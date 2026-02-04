@@ -1,11 +1,13 @@
 import streamlit as st
 import pandas as pd
-import os
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey
+import re
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey, Text
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# --- 1. CẤU HÌNH DATABASE ---
+# ==========================================
+# 1. CẤU HÌNH DATABASE & MODELS
+# ==========================================
 Base = declarative_base()
 engine = create_engine('sqlite:///database.db', connect_args={'check_same_thread': False})
 Session = sessionmaker(bind=engine)
@@ -19,11 +21,15 @@ class User(Base):
     ho_ten = Column(String(100), nullable=False)
     password_hash = Column(String(200))
     is_admin = Column(Boolean, default=False)
-    is_active_account = Column(Boolean, default=False)
-    khoi_lop = Column(Integer, default=10)
-    lop_hoc = Column(String(20), nullable=True)
-    nam_hoc = Column(String(20))
+    
+    # Niên khóa: VD "2023-2026" (Dùng để tính Lớp 10, 11, 12)
+    nien_khoa = Column(String(20)) 
+    
+    # Trạng thái đăng nhập: "full" hoặc số lần còn lại (dạng string)
+    login_status = Column(String(20), default="full") 
+    
     scores = relationship('Score', backref='student', lazy=True)
+    assessments = relationship('Assessment', backref='student', lazy=True)
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -35,291 +41,483 @@ class Score(Base):
     id = Column(Integer, primary_key=True)
     student_id = Column(Integer, ForeignKey('user.id'), nullable=False)
     mon_hoc = Column(String(50), nullable=False)
-    ddg_tx = Column(String(100), nullable=True)  
-    ddg_gk = Column(String(50), nullable=True)
-    ddg_ck = Column(String(50), nullable=True)
-    dtb_mon = Column(String(50), nullable=True)
+    # Lưu điểm dạng chuỗi để giữ format gốc
+    ddg_tx = Column(String(100)) 
+    ddg_gk = Column(String(50))
+    ddg_ck = Column(String(50))
+    dtb_mon = Column(String(50))
     
-    hoc_ky = Column(String(20), nullable=False)
-    khoi = Column(Integer, nullable=False)
+    hoc_ky = Column(String(20)) # HK1, HK2, CaNam
+    nam_hoc = Column(String(20)) # VD: "2023-2024"
+    khoi = Column(Integer) # 10, 11, 12 (Tự tính)
+
+class Assessment(Base):
+    """Bảng lưu đánh giá cuối năm (Hạnh kiểm, Học lực, Danh hiệu)"""
+    __tablename__ = 'assessment'
+    id = Column(Integer, primary_key=True)
+    student_id = Column(Integer, ForeignKey('user.id'), nullable=False)
     nam_hoc = Column(String(20))
+    kq_hoc_tap = Column(String(50)) # Tốt/Khá...
+    kq_ren_luyen = Column(String(50))
+    danh_hieu = Column(String(100))
+    nhan_xet = Column(Text)
 
 Base.metadata.create_all(engine)
 
-# Tạo Admin
-try:
-    if not session.query(User).filter_by(so_cccd='admin').first():
-        admin = User(so_cccd='admin', ho_ten='Quản Trị Viên', is_admin=True, is_active_account=True)
-        admin.set_password('admin123')
-        session.add(admin)
-        session.commit()
-except Exception: session.rollback()
+# Tạo Admin mặc định
+if not session.query(User).filter_by(so_cccd='admin').first():
+    admin = User(so_cccd='admin', ho_ten='Quản Trị Viên', is_admin=True, nien_khoa="System", login_status="full")
+    admin.set_password('admin123')
+    session.add(admin)
+    session.commit()
 
-# --- 2. HÀM XỬ LÝ (CÓ DEBUG CHI TIẾT) ---
-def clean_val(val):
+# ==========================================
+# 2. HÀM XỬ LÝ LOGIC (PARSER THÔNG MINH)
+# ==========================================
+
+def clean_str(val):
     if pd.isna(val) or str(val).strip() == '': return None
-    # Xử lý trường hợp số float như 9.6 bị thành 9.60000001
     s = str(val).strip()
-    if s.endswith('.0'): s = s[:-2]
-    return s
+    return s.replace('.0', '') if s.endswith('.0') and len(s) > 2 else s
 
-def process_vnedu_upload(df, khoi, hoc_ky_selected, nam_hoc):
+def detect_file_info(df):
+    """
+    Đọc 10 dòng đầu của file Excel để tìm:
+    1. Năm học (Regex: Năm học 2023 - 2024)
+    2. Học kỳ (Học kỳ 1 / Học kỳ 2 / Nếu không thấy -> Cả năm)
+    """
+    content = df.head(10).to_string()
+    
+    # 1. Tìm năm học
+    # Pattern: 20xx - 20xx hoặc 20xx-20xx
+    year_match = re.search(r'(\d{4})\s*-\s*(\d{4})', content)
+    nam_hoc = f"{year_match.group(1)}-{year_match.group(2)}" if year_match else None
+    
+    # 2. Tìm học kỳ
+    if "Học kỳ 1" in content or "HỌC KỲ 1" in content:
+        hoc_ky = "HK1"
+    elif "Học kỳ 2" in content or "HỌC KỲ 2" in content:
+        hoc_ky = "HK2"
+    else:
+        # Mặc định là Cả Năm nếu không tìm thấy chữ Học kỳ
+        hoc_ky = "CaNam"
+        
+    return nam_hoc, hoc_ky
+
+def calculate_grade(student_nien_khoa, file_nam_hoc):
+    """
+    Tính Khối (10, 11, 12) dựa trên Niên khóa HS và Năm học file.
+    VD: HS niên khóa 2023-2026. File 2023-2024 -> Lớp 10.
+    """
+    try:
+        start_student = int(student_nien_khoa.split('-')[0])
+        start_file = int(file_nam_hoc.split('-')[0])
+        delta = start_file - start_student
+        
+        if delta == 0: return 10
+        elif delta == 1: return 11
+        elif delta == 2: return 12
+        else: return 0 # Không xác định hoặc ở lại lớp/vượt lớp
+    except:
+        return 0
+
+def process_upload_auto(df):
+    """
+    Hàm xử lý đa năng: Tự động phát hiện mọi thứ
+    """
+    # 1. Phát hiện metadata từ header
+    nam_hoc, hoc_ky = detect_file_info(df)
+    if not nam_hoc:
+        return "❌ Không tìm thấy thông tin 'Năm học' trong file (cần dòng chữ dạng 'Năm học 20xx - 20xx').", "error"
+
     row_count, col_count = df.shape
-    students_found = 0
-    scores_added = 0
+    students_updated = 0
     
-    # Khu vực hiển thị log debug cho người dùng thấy
-    debug_container = st.expander(f"🔍 Xem chi tiết quá trình xử lý file (Click để mở)", expanded=True)
-    
-    with debug_container:
-        st.write(f"Đang xử lý file... Kích thước: {row_count} dòng, {col_count} cột.")
-        st.write(f"Thông tin áp dụng: Khối {khoi} | {hoc_ky_selected} | Năm {nam_hoc}")
-
-    progress_bar = st.progress(0)
+    progress = st.progress(0)
     
     for r in range(row_count):
-        if r % 50 == 0: progress_bar.progress(min(r / row_count, 1.0))
+        if r % 50 == 0: progress.progress(min(r / row_count, 1.0))
         
         for c in range(col_count):
             val = str(df.iat[r, c]).strip()
             
-            # TÌM MÃ HS
+            # --- TÌM HỌC SINH ---
             if "Mã HS" in val:
                 ma_hs = ""
+                # Logic lấy mã HS (chung ô hoặc lệch ô)
                 if ":" in val and len(val.split(':')[-1].strip()) > 3:
                     ma_hs = val.split(':')[-1].strip()
                 else:
-                    for offset in range(1, 5): 
-                        if c + offset < col_count:
-                            candidate = str(df.iat[r, c + offset]).strip()
-                            if len(candidate) > 4 and candidate[0].isdigit(): 
-                                ma_hs = candidate
-                                break
+                    for k in range(1, 5):
+                        if c + k < col_count:
+                            cand = str(df.iat[r, c + k]).strip()
+                            if len(cand) > 4 and cand[0].isdigit():
+                                ma_hs = cand; break
                 
                 if not ma_hs: continue
-                if ma_hs.endswith('.0'): ma_hs = ma_hs[:-2]
-
-                student = session.query(User).filter_by(ma_hs=ma_hs).first()
-                if not student:
-                    # Debug: Báo nếu không tìm thấy User
-                    # with debug_container: st.warning(f"⚠️ Bỏ qua Mã HS {ma_hs} (Chưa tạo tài khoản)")
-                    continue
+                ma_hs = ma_hs.replace('.0', '')
                 
-                students_found += 1
+                # Check DB
+                user = session.query(User).filter_by(ma_hs=ma_hs).first()
+                if not user: continue # Bỏ qua nếu chưa tạo acc
                 
-                # TÌM HEADER
-                header_row_idx = -1
-                col_mon_idx = -1
+                # Tự tính Khối
+                khoi = calculate_grade(user.nien_khoa, nam_hoc)
+                if khoi == 0: continue # Lỗi niên khóa
                 
-                # Quét 5 dòng dưới Mã HS để tìm chữ "Môn học"
-                for k in range(1, 6):
+                students_updated += 1
+                
+                # --- TÌM BẢNG ĐIỂM (HEADER) ---
+                header_row = -1
+                col_mon = -1
+                
+                # Quét 6 dòng dưới Mã HS để tìm header
+                for k in range(1, 7):
                     if r + k >= row_count: break
                     for check_c in range(col_count):
-                         cell_val = str(df.iat[r + k, check_c]).strip().lower()
-                         if "môn" in cell_val and "học" in cell_val:
-                             header_row_idx = r + k
-                             col_mon_idx = check_c
-                             break
-                    if header_row_idx != -1: break
+                        txt = str(df.iat[r+k, check_c]).lower()
+                        if "môn" in txt and "học" in txt:
+                            header_row = r + k
+                            col_mon = check_c
+                            break
+                    if header_row != -1: break
                 
-                if header_row_idx == -1: 
-                    with debug_container: st.error(f"❌ Mã HS {ma_hs}: Không tìm thấy dòng tiêu đề 'Môn học' ở dưới.")
-                    continue
-                
-                # MAP CỘT
-                col_tx = -1
-                col_gk = -1
-                col_ck = -1
-                col_tb = -1
-                
-                for check_c in range(col_count):
-                    header_txt = str(df.iat[header_row_idx, check_c]).strip().lower()
-                    if hoc_ky_selected in ['HK1', 'HK2']:
-                        if "đđgtx" in header_txt: col_tx = check_c
-                        elif "đđggk" in header_txt: col_gk = check_c
-                        elif "đđgck" in header_txt: col_ck = check_c
-                        elif header_txt == "tb" or "tbm" in header_txt: col_tb = check_c
-                    else: # CaNam
-                        if "cả năm" in header_txt: col_tb = check_c 
+                if header_row == -1: continue
 
-                # Debug: In ra nếu là học sinh đầu tiên tìm thấy để kiểm tra cột
-                if students_found == 1:
-                    with debug_container:
-                        st.info(f"✅ Đã tìm thấy HS đầu tiên: {ma_hs}. Header dòng {header_row_idx}.")
-                        st.write(f"Mapping cột: TX={col_tx}, GK={col_gk}, CK={col_ck}, TB={col_tb}")
-
-                # LẤY ĐIỂM
-                start_data_row = header_row_idx + 1
-                for i in range(20): 
-                    curr = start_data_row + i
+                # --- XỬ LÝ ĐIỂM (SCORES) ---
+                # Map cột
+                col_tx = col_gk = col_ck = col_tb = -1
+                for cc in range(col_count):
+                    h_txt = str(df.iat[header_row, cc]).lower()
+                    if hoc_ky == "CaNam":
+                        if "cả năm" in h_txt: col_tb = cc
+                    else:
+                        if "tx" in h_txt: col_tx = cc
+                        elif "gk" in h_txt: col_gk = cc
+                        elif "ck" in h_txt: col_ck = cc
+                        elif h_txt == "tb" or "tbm" in h_txt: col_tb = cc
+                
+                # Đọc rows điểm
+                curr = header_row + 1
+                last_score_row = curr # Lưu vết để tìm đánh giá sau này
+                
+                for _ in range(20):
                     if curr >= row_count: break
+                    mon = str(df.iat[curr, col_mon]).strip()
                     
-                    mon_hoc = str(df.iat[curr, col_mon_idx]).strip()
-                    if not mon_hoc or mon_hoc.lower() in ['nan', ''] or "kết quả" in mon_hoc.lower(): break
-                    if mon_hoc.isdigit(): continue
-                    
-                    val_tx = clean_val(df.iat[curr, col_tx]) if col_tx != -1 else None
-                    val_gk = clean_val(df.iat[curr, col_gk]) if col_gk != -1 else None
-                    val_ck = clean_val(df.iat[curr, col_ck]) if col_ck != -1 else None
-                    val_tb = clean_val(df.iat[curr, col_tb]) if col_tb != -1 else None
-                    
-                    # Debug: In ra điểm Toán của HS đầu tiên để check
-                    if students_found == 1 and "Toán" in mon_hoc:
-                         with debug_container:
-                             st.write(f"👉 Thử đọc điểm {mon_hoc}: TX=[{val_tx}] | GK=[{val_gk}] | CK=[{val_ck}]")
+                    # Điều kiện dừng đọc môn
+                    if not mon or mon.lower() in ['nan', ''] or "kết quả" in mon.lower() or "xếp loại" in mon.lower():
+                        last_score_row = curr
+                        break
+                    if mon.isdigit(): continue # Bỏ qua STT
 
-                    # LƯU DB
+                    # Lấy values
+                    v_tx = clean_str(df.iat[curr, col_tx]) if col_tx != -1 else None
+                    v_gk = clean_str(df.iat[curr, col_gk]) if col_gk != -1 else None
+                    v_ck = clean_str(df.iat[curr, col_ck]) if col_ck != -1 else None
+                    v_tb = clean_str(df.iat[curr, col_tb]) if col_tb != -1 else None
+                    
+                    # Upsert Score
                     score = session.query(Score).filter_by(
-                        student_id=student.id, mon_hoc=mon_hoc, khoi=khoi, hoc_ky=hoc_ky_selected, nam_hoc=nam_hoc
+                        student_id=user.id, mon_hoc=mon, nam_hoc=nam_hoc, hoc_ky=hoc_ky
                     ).first()
                     
                     if not score:
-                        score = Score(student_id=student.id, mon_hoc=mon_hoc, khoi=khoi, hoc_ky=hoc_ky_selected, nam_hoc=nam_hoc)
+                        score = Score(student_id=user.id, mon_hoc=mon, nam_hoc=nam_hoc, hoc_ky=hoc_ky, khoi=khoi)
                         session.add(score)
                     
-                    score.ddg_tx = val_tx
-                    score.ddg_gk = val_gk
-                    score.ddg_ck = val_ck
-                    score.dtb_mon = val_tb
-                    scores_added += 1
+                    score.ddg_tx = v_tx
+                    score.ddg_gk = v_gk
+                    score.ddg_ck = v_ck
+                    score.dtb_mon = v_tb
+                    
+                    curr += 1
+                    last_score_row = curr
+
+                # --- XỬ LÝ ĐÁNH GIÁ (ASSESSMENT) - Chỉ file Cả Năm ---
+                if hoc_ky == "CaNam":
+                    # Quét tiếp từ dòng last_score_row xuống dưới để tìm KQHT, KQRL
+                    kq_ht = kq_rl = danh_hieu = nhan_xet = None
+                    
+                    # Quét khoảng 10 dòng dưới bảng điểm
+                    for k in range(10):
+                        check_r = last_score_row + k
+                        if check_r >= row_count: break
+                        
+                        # Gom text của cả dòng lại để search cho dễ
+                        row_text = " | ".join([str(df.iat[check_r, cx]) for cx in range(col_count) if pd.notna(df.iat[check_r, cx])])
+                        
+                        # Tìm mẫu: KQHT: Tốt | KQRL: Tốt
+                        if "KQHT" in row_text or "Học lực" in row_text or "Học tập" in row_text:
+                            # Parse đơn giản
+                            parts = row_text.split('|')
+                            for p in parts:
+                                if "KQHT" in p or "Học lực" in p or "Học tập" in p:
+                                    kq_ht = p.split(':')[-1].strip()
+                                if "KQRL" in p or "Hạnh kiểm" in p or "Rèn luyện" in p:
+                                    kq_rl = p.split(':')[-1].strip()
+                                if "Danh hiệu" in p:
+                                    danh_hieu = p.split(':')[-1].strip()
+                        
+                        if "Nhận xét" in row_text:
+                             nhan_xet = row_text.split(':')[-1].strip()
+
+                    # Lưu Assessment
+                    if kq_ht or kq_rl or danh_hieu:
+                        ass = session.query(Assessment).filter_by(student_id=user.id, nam_hoc=nam_hoc).first()
+                        if not ass:
+                            ass = Assessment(student_id=user.id, nam_hoc=nam_hoc)
+                            session.add(ass)
+                        
+                        ass.kq_hoc_tap = kq_ht
+                        ass.kq_ren_luyen = kq_rl
+                        ass.danh_hieu = danh_hieu
+                        ass.nhan_xet = nhan_xet
 
     session.commit()
-    progress_bar.empty()
-    
-    if students_found == 0:
-        return "⚠️ Không tìm thấy Mã HS nào khớp với Tài khoản.", "warning"
-    return f"✅ Đã xử lý {students_found} HS. Cập nhật thành công {scores_added} dòng điểm.", "success"
+    progress.empty()
+    return f"Đã xử lý {students_updated} học sinh. Năm: {nam_hoc} - {hoc_ky}", "success"
 
-# --- 3. GIAO DIỆN HỌC SINH ---
-def student_interface(user):
-    st.markdown(f"### 👋 Xin chào, **{user.ho_ten}**")
-    st.caption(f"Mã HS: {user.ma_hs} | Niên khóa dữ liệu: {user.nam_hoc}")
+
+# ==========================================
+# 3. GIAO DIỆN HỌC SINH (Student UI)
+# ==========================================
+def student_ui(user):
+    # CSS tùy chỉnh cho đẹp
+    st.markdown("""
+    <style>
+        .grade-card { background-color: #f0f2f6; padding: 20px; border-radius: 10px; margin-bottom: 20px; border-left: 5px solid #4CAF50; }
+        .assessment-box { background-color: #e3f2fd; padding: 15px; border-radius: 8px; border: 1px solid #90caf9; }
+        .metric-box { text-align: center; background: white; padding: 10px; border-radius: 5px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.title(f"📚 Hồ Sơ Học Tập: {user.ho_ten}")
     
-    if st.button("Đăng xuất"):
+    # Header Info
+    c1, c2, c3 = st.columns(3)
+    c1.info(f"🆔 Mã HS: **{user.ma_hs}**")
+    c2.info(f"📅 Niên khóa: **{user.nien_khoa}**")
+    
+    # Hiển thị số lượt đăng nhập còn lại
+    status_text = "Không giới hạn" if user.login_status == "full" else f"Còn {user.login_status} lần"
+    status_color = "green" if user.login_status == "full" or int(user.login_status) > 2 else "red"
+    c3.markdown(f"<div style='background:#fff3cd; padding:15px; border-radius:5px; color:{status_color}; text-align:center; font-weight:bold'>🔑 Đăng nhập: {status_text}</div>", unsafe_allow_html=True)
+
+    if st.button("Đăng xuất", type="primary"):
         st.session_state.logged_in = False
         st.rerun()
-
-    # Bộ lọc
-    avail_years = session.query(Score.nam_hoc).filter_by(student_id=user.id).distinct().all()
-    list_years = [y[0] for y in avail_years if y[0]]
-    list_years.sort(reverse=True)
     
-    if not list_years:
-        st.info("📭 Chưa có dữ liệu điểm.")
+    st.divider()
+
+    # TABS 3 NĂM HỌC
+    # Tính toán năm học dựa trên niên khóa
+    try:
+        start_year = int(user.nien_khoa.split('-')[0])
+        years_map = {
+            10: f"{start_year}-{start_year+1}",
+            11: f"{start_year+1}-{start_year+2}",
+            12: f"{start_year+2}-{start_year+3}"
+        }
+    except:
+        st.error("Lỗi dữ liệu niên khóa. Vui lòng liên hệ Admin.")
         return
 
-    c1, c2 = st.columns(2)
-    with c1: s_year = st.selectbox("Năm học", list_years)
-    
-    # Lấy học kỳ có dữ liệu của năm đó
-    avail_sems = session.query(Score.hoc_ky).filter_by(student_id=user.id, nam_hoc=s_year).distinct().all()
-    raw_sems = [s[0] for s in avail_sems if s[0]]
-    
-    # Map tên hiển thị
-    map_sem = {'HK1': 'Học kỳ 1', 'HK2': 'Học kỳ 2', 'CaNam': 'Cả Năm'}
-    display_sems = [map_sem.get(k, k) for k in raw_sems]
-    
-    with c2: s_sem_display = st.selectbox("Học kỳ", display_sems)
-    
-    # Dịch ngược lại để query DB
-    rev_map = {v: k for k, v in map_sem.items()}
-    s_sem_raw = rev_map.get(s_sem_display, s_sem_display)
+    tab10, tab11, tab12 = st.tabs([f"Lớp 10 ({years_map[10]})", f"Lớp 11 ({years_map[11]})", f"Lớp 12 ({years_map[12]})"])
 
-    # Query
-    scores = session.query(Score).filter_by(student_id=user.id, nam_hoc=s_year, hoc_ky=s_sem_raw).all()
-    
-    if scores:
-        data = []
-        for s in scores:
-            item = {"Môn": s.mon_hoc}
-            if s_sem_raw in ['HK1', 'HK2']:
-                item["TX"] = s.ddg_tx
-                item["GK"] = s.ddg_gk
-                item["CK"] = s.ddg_ck
-                item["TB Môn"] = s.dtb_mon
-            else:
-                item["TB Cả Năm"] = s.dtb_mon
-            data.append(item)
-        st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
-    else:
-        st.warning("Không có dữ liệu.")
+    for grade, tab in zip([10, 11, 12], [tab10, tab11, tab12]):
+        with tab:
+            target_nam_hoc = years_map[grade]
+            
+            # Lấy dữ liệu điểm
+            scores_hk1 = session.query(Score).filter_by(student_id=user.id, nam_hoc=target_nam_hoc, hoc_ky="HK1").all()
+            scores_hk2 = session.query(Score).filter_by(student_id=user.id, nam_hoc=target_nam_hoc, hoc_ky="HK2").all()
+            scores_cn = session.query(Score).filter_by(student_id=user.id, nam_hoc=target_nam_hoc, hoc_ky="CaNam").all()
+            assessment = session.query(Assessment).filter_by(student_id=user.id, nam_hoc=target_nam_hoc).first()
 
-# --- 4. GIAO DIỆN ADMIN ---
-def admin_interface():
-    st.title("👨‍🏫 Quản Trị Hệ Thống")
+            if not (scores_hk1 or scores_hk2 or scores_cn):
+                st.warning(f"Chưa có dữ liệu cho năm học {target_nam_hoc}")
+                continue
+
+            # --- PHẦN 1: BẢNG ĐIỂM CHI TIẾT ---
+            col_hk1, col_hk2, col_cn = st.columns([1.2, 1.2, 0.8])
+            
+            with col_hk1:
+                st.markdown("##### 🍂 Học kỳ 1")
+                if scores_hk1:
+                    df1 = pd.DataFrame([{"Môn": s.mon_hoc, "TB": s.dtb_mon, "Chi tiết": f"{s.ddg_tx or ''} | {s.ddg_gk or ''}"} for s in scores_hk1])
+                    st.dataframe(df1, hide_index=True, use_container_width=True)
+                else: st.caption("Chưa có")
+
+            with col_hk2:
+                st.markdown("##### 🌸 Học kỳ 2")
+                if scores_hk2:
+                    df2 = pd.DataFrame([{"Môn": s.mon_hoc, "TB": s.dtb_mon, "Chi tiết": f"{s.ddg_tx or ''} | {s.ddg_gk or ''}"} for s in scores_hk2])
+                    st.dataframe(df2, hide_index=True, use_container_width=True)
+                else: st.caption("Chưa có")
+            
+            with col_cn:
+                st.markdown("##### 🏆 Cả năm")
+                if scores_cn:
+                    df3 = pd.DataFrame([{"Môn": s.mon_hoc, "TB": s.dtb_mon} for s in scores_cn])
+                    st.dataframe(df3, hide_index=True, use_container_width=True)
+                else: st.caption("Chưa có")
+
+            # --- PHẦN 2: TỔNG KẾT & ĐÁNH GIÁ (CARD UI) ---
+            st.write("")
+            if assessment:
+                st.markdown(f"""
+                <div class="assessment-box">
+                    <h4 style="margin-top:0; color:#1565c0">🏅 Tổng Kết Năm Học {target_nam_hoc}</h4>
+                    <p><b>Học tập (KQHT):</b> {assessment.kq_hoc_tap or '---'} &nbsp;&nbsp;|&nbsp;&nbsp; 
+                       <b>Rèn luyện (KQRL):</b> {assessment.kq_ren_luyen or '---'}</p>
+                    <p><b>Danh hiệu:</b> <span style="color:#d32f2f; font-weight:bold">{assessment.danh_hieu or '---'}</span></p>
+                    <p><i>Nhận xét: {assessment.nhan_xet or ''}</i></p>
+                </div>
+                """, unsafe_allow_html=True)
+
+# ==========================================
+# 4. GIAO DIỆN ADMIN (Admin UI)
+# ==========================================
+def admin_ui():
+    st.title("⚙️ Trung Tâm Quản Trị")
     if st.button("Đăng xuất"):
         st.session_state.logged_in = False
         st.rerun()
 
-    tab1, tab2 = st.tabs(["📤 Upload Dữ Liệu", "🔧 Công Cụ"])
+    tab1, tab2 = st.tabs(["📤 Upload Dữ Liệu", "👥 Quản Lý Tài Khoản"])
 
     with tab1:
-        st.subheader("1. Danh sách Học sinh")
-        f_acc = st.file_uploader("File Account", key="u_acc")
-        if f_acc and st.button("Xử lý Account"):
+        st.subheader("1. Import Tài Khoản Học Sinh")
+        st.caption("File Excel cần cột: So_CCCD, Ma_HS, Ho_Ten, Nien_Khoa (VD: 2023-2026), Trang_Thai ('full' hoặc số)")
+        
+        f_acc = st.file_uploader("Chọn file Danh sách lớp", key="acc")
+        if f_acc and st.button("Cập nhật Tài Khoản"):
             try:
                 df = pd.read_excel(f_acc)
-                df.columns = [str(c).strip() for c in df.columns]
-                cols = {c.lower(): c for c in df.columns}
-                if 'so_cccd' not in cols or 'ma_hs' not in cols:
-                    st.error("Thiếu cột So_CCCD hoặc Ma_HS")
-                else:
-                    c = 0
-                    for _, row in df.iterrows():
-                        cccd = str(row[cols['so_cccd']]).strip().replace('.0', '')
-                        ma = str(row[cols['ma_hs']]).strip().replace('.0', '')
-                        name = row.get(cols.get('ho_ten', 'Ho_Ten'), 'HS')
-                        if not session.query(User).filter_by(so_cccd=cccd).first():
-                            session.add(User(so_cccd=cccd, ma_hs=ma, ho_ten=name, is_active_account=True, password_hash=generate_password_hash('123456')))
-                            c+=1
-                    session.commit()
-                    st.success(f"Thêm {c} user.")
-            except Exception as e: st.error(str(e))
-        
-        st.divider()
-        st.subheader("2. Upload Điểm")
-        c1, c2, c3 = st.columns(3)
-        with c1: khoi = st.selectbox("Khối", [10, 11, 12])
-        with c2: ky = st.selectbox("Loại điểm", ["HK1", "HK2", "CaNam"]) 
-        with c3: nam = st.text_input("Năm học", "2025-2026")
+                df.columns = [str(c).strip().lower() for c in df.columns]
+                
+                # Mapping cột mềm dẻo
+                col_map = {c: c for c in df.columns} # Default
+                for c in df.columns:
+                    if "cccd" in c: col_map['cccd'] = c
+                    if "mã" in c or "ma_hs" in c: col_map['ma'] = c
+                    if "tên" in c: col_map['ten'] = c
+                    if "niên" in c or "khoa" in c: col_map['khoa'] = c
+                    if "trạng" in c or "status" in c: col_map['status'] = c
 
-        f_scr = st.file_uploader("File Điểm", accept_multiple_files=True, key="u_scr")
-        if f_scr and st.button("Lưu Điểm"):
-            for f in f_scr:
+                count = 0
+                for _, row in df.iterrows():
+                    # Lấy dữ liệu an toàn
+                    cccd = str(row[col_map.get('cccd', 'so_cccd')]).strip().replace('.0','')
+                    ma = str(row[col_map.get('ma', 'ma_hs')]).strip().replace('.0','')
+                    ten = row[col_map.get('ten', 'ho_ten')]
+                    khoa = str(row[col_map.get('khoa', 'nien_khoa')]).strip()
+                    # Mặc định là 'full' nếu không có cột status
+                    stt = str(row[col_map.get('status', 'xx')]).strip() if 'status' in col_map else 'full'
+                    if stt == 'nan': stt = 'full'
+
+                    u = session.query(User).filter_by(so_cccd=cccd).first()
+                    if not u:
+                        u = User(so_cccd=cccd, ma_hs=ma, ho_ten=ten, nien_khoa=khoa, login_status=stt)
+                        u.set_password('123456')
+                        session.add(u)
+                        count += 1
+                    else:
+                        u.ma_hs = ma
+                        u.nien_khoa = khoa
+                        u.login_status = stt
+                
+                session.commit()
+                st.success(f"Đã cập nhật {count} tài khoản mới!")
+            except Exception as e:
+                st.error(f"Lỗi đọc file: {e}")
+
+        st.divider()
+        st.subheader("2. Upload Bảng Điểm (Auto-Detect)")
+        st.caption("Chỉ cần kéo thả file (HK1, HK2, Cả năm). Hệ thống tự đọc Năm học & Học kỳ trong nội dung file.")
+        
+        files = st.file_uploader("Chọn các file điểm (có thể chọn nhiều file)", accept_multiple_files=True, key="scr")
+        if files and st.button("Bắt đầu Xử lý Điểm"):
+            for f in files:
                 try:
                     eng = 'xlrd' if f.name.endswith('.xls') else 'openpyxl'
                     df = pd.read_excel(f, header=None, engine=eng)
-                    msg, stt = process_vnedu_upload(df, khoi, ky, nam)
-                    if stt == 'success': st.success(f"{f.name}: {msg}")
-                    else: st.warning(f"{f.name}: {msg}")
-                except Exception as e: st.error(f"{f.name}: {e}")
+                    msg, status = process_upload_auto(df)
+                    if status == "success": st.success(f"✅ {f.name}: {msg}")
+                    else: st.error(f"❌ {f.name}: {msg}")
+                except Exception as e:
+                    st.error(f"⚠️ Lỗi file {f.name}: {e}")
 
     with tab2:
-        if st.button("🗑️ Reset All Data"):
-            session.query(Score).delete()
-            session.query(User).filter(User.is_admin == False).delete()
-            session.commit()
-            st.success("Đã xóa sạch!")
-            st.rerun()
+        st.subheader("Danh sách User")
+        users = session.query(User).filter(User.is_admin == False).all()
+        if users:
+            data = [{"CCCD": u.so_cccd, "Tên": u.ho_ten, "Niên khóa": u.nien_khoa, "Lượt Login": u.login_status} for u in users]
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
+            
+            if st.button("Reset tất cả lượt Login về Full"):
+                for u in users: u.login_status = "full"
+                session.commit()
+                st.success("Đã reset!")
+                st.rerun()
 
-# --- MAIN ---
-st.set_page_config(page_title="EduScore")
-if 'logged_in' not in st.session_state: st.session_state.logged_in = False
-if 'user_id' not in st.session_state: st.session_state.user_id = None
-if 'is_admin' not in st.session_state: st.session_state.is_admin = False
+# ==========================================
+# 5. HÀM MAIN
+# ==========================================
+def main():
+    st.set_page_config(page_title="EduScore Pro", page_icon="🎓", layout="wide")
+    
+    if 'logged_in' not in st.session_state: st.session_state.logged_in = False
+    if 'user_id' not in st.session_state: st.session_state.user_id = None
+    if 'is_admin' not in st.session_state: st.session_state.is_admin = False
 
-if not st.session_state.logged_in:
-    st.title("Đăng Nhập")
-    u = st.text_input("User")
-    p = st.text_input("Pass", type="password")
-    if st.button("Login"):
-        user = session.query(User).filter_by(so_cccd=u).first()
-        if user and user.check_password(p):
-            st.session_state.logged_in = True
-            st.session_state.user_id = user.id
-            st.session_state.is_admin = user.is_admin
-            st.rerun()
-        else: st.error("Sai thông tin")
-else:
-    if st.session_state.is_admin: admin_interface()
-    else: student_interface(session.query(User).get(st.session_state.user_id))
+    if not st.session_state.logged_in:
+        c1, c2, c3 = st.columns([1,1.5,1])
+        with c2:
+            st.markdown("<h1 style='text-align: center; color: #1565c0;'>🎓 CỔNG TRA CỨU ĐIỂM THPT</h1>", unsafe_allow_html=True)
+            st.markdown("<p style='text-align: center;'>Hệ thống tra cứu điểm số tập trung 3 năm học</p>", unsafe_allow_html=True)
+            
+            with st.form("login_form"):
+                cccd = st.text_input("Số CCCD / Tên đăng nhập")
+                pwd = st.text_input("Mật khẩu", type="password")
+                btn = st.form_submit_button("Đăng nhập", type="primary", use_container_width=True)
+                
+                if btn:
+                    user = session.query(User).filter_by(so_cccd=cccd).first()
+                    if user and user.check_password(pwd):
+                        # Logic kiểm tra số lần đăng nhập
+                        allow_login = False
+                        if user.is_admin:
+                            allow_login = True
+                        else:
+                            if user.login_status == "full":
+                                allow_login = True
+                            else:
+                                try:
+                                    count = int(user.login_status)
+                                    if count > 0:
+                                        allow_login = True
+                                        user.login_status = str(count - 1) # Trừ 1 lần
+                                        session.commit()
+                                    else:
+                                        st.error("🚫 Bạn đã hết lượt truy cập cho phép.")
+                                except:
+                                    st.error("Lỗi trạng thái tài khoản.")
+
+                        if allow_login:
+                            st.session_state.logged_in = True
+                            st.session_state.user_id = user.id
+                            st.session_state.is_admin = user.is_admin
+                            st.rerun()
+                    else:
+                        st.error("Sai thông tin đăng nhập")
+    else:
+        if st.session_state.is_admin:
+            admin_ui()
+        else:
+            user = session.query(User).get(st.session_state.user_id)
+            student_ui(user)
+
+if __name__ == "__main__":
+    main()
