@@ -2,6 +2,5 @@ streamlit
 pandas
 openpyxl
 xlrd>=2.0.1
-sqlalchemy==1.4.52
+sqlalchemy
 werkzeug
-watchdog
