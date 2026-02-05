@@ -6,12 +6,28 @@ from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # ==========================================
-# 1. CẤU HÌNH DATABASE
+# 1. CẤU HÌNH DATABASE (POSTGRESQL - NEON)
 # ==========================================
 Base = declarative_base()
-engine = create_engine('sqlite:///database.db', connect_args={'check_same_thread': False})
+
+# Lấy chuỗi kết nối từ Secrets
+# Nếu chạy dưới máy (localhost) mà chưa cấu hình secret thì fallback về sqlite tạm
+try:
+    db_url = st.secrets["DB_CONNECTION_STRING"]
+    # Fix lỗi thư viện cũ: chuyển postgres:// thành postgresql://
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+        
+    # Kết nối Postgres
+    engine = create_engine(db_url)
+except:
+    # Fallback cho local (nếu bạn chạy máy tính cá nhân không có mạng)
+    engine = create_engine('sqlite:///database.db', connect_args={'check_same_thread': False})
+
 Session = sessionmaker(bind=engine)
 session = Session()
+
+# ... (Phần Class User, Score, Assessment GIỮ NGUYÊN KHÔNG ĐỔI) ...
 
 class User(Base):
     __tablename__ = 'user'
@@ -451,3 +467,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
