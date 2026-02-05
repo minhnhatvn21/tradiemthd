@@ -36,7 +36,7 @@ class User(Base):
     password_hash = Column(String(200))
     is_admin = Column(Boolean, default=False)
     nien_khoa = Column(String(20)) 
-    login_status = Column(String(20), default="full") 
+    login_status = Column(String(20), default="5") 
     
     scores = relationship('Score', backref='student', lazy=True)
     assessments = relationship('Assessment', backref='student', lazy=True)
@@ -88,6 +88,7 @@ def clean_str(val):
     return s.replace('.0', '') if s.endswith('.0') and len(s) > 2 else s
 
 def detect_file_info(df):
+    # Đọc 15 dòng đầu để tìm thông tin
     content = df.head(15).to_string()
     year_match = re.search(r'(\d{4})\s*-\s*(\d{4})', content)
     nam_hoc = f"{year_match.group(1)}-{year_match.group(2)}" if year_match else None
@@ -107,7 +108,7 @@ def calculate_grade(student_nien_khoa, file_nam_hoc):
 
 def process_upload_auto(df):
     nam_hoc, hoc_ky = detect_file_info(df)
-    if not nam_hoc: return "❌ Không tìm thấy 'Năm học' trong file.", "error"
+    if not nam_hoc: return "❌ Không tìm thấy 'Năm học' (20xx - 20xx) trong file.", "error"
 
     row_count, col_count = df.shape
     students_updated = 0
@@ -115,8 +116,10 @@ def process_upload_auto(df):
     
     for r in range(row_count):
         if r % 50 == 0: progress.progress(min(r / row_count, 1.0))
+        
         for c in range(col_count):
             val = str(df.iat[r, c]).strip()
+            # Tìm Mã HS
             if "Mã HS" in val:
                 ma_hs = ""
                 if ":" in val and len(val.split(':')[-1].strip()) > 3:
@@ -137,6 +140,8 @@ def process_upload_auto(df):
                 if khoi == 0: continue
                 
                 students_updated += 1
+                
+                # Tìm dòng Header (Môn học)
                 header_row = -1; col_mon = -1
                 for k in range(1, 9):
                     if r + k >= row_count: break
@@ -145,9 +150,9 @@ def process_upload_auto(df):
                         if "môn" in txt and "học" in txt:
                             header_row = r + k; col_mon = check_c; break
                     if header_row != -1: break
-                
                 if header_row == -1: continue
 
+                # Map cột điểm
                 col_tx = col_gk = col_ck = col_tb = -1
                 for cc in range(col_count):
                     h_txt = str(df.iat[header_row, cc]).lower()
@@ -160,6 +165,7 @@ def process_upload_auto(df):
                         elif "ck" in h_txt: col_ck = cc
                         elif h_txt == "tb" or "tbm" in h_txt: col_tb = cc
                 
+                # Đọc dữ liệu điểm
                 curr = header_row + 1; last_row = curr
                 for _ in range(25): 
                     if curr >= row_count: break
@@ -182,6 +188,7 @@ def process_upload_auto(df):
                     score.ddg_tx = v_tx; score.ddg_gk = v_gk; score.ddg_ck = v_ck; score.dtb_mon = v_tb
                     curr += 1; last_row = curr
 
+                # Đọc đánh giá (Cả năm)
                 if hoc_ky == "CaNam":
                     k_ht = k_rl = dh = nx = None
                     for k in range(15):
@@ -206,106 +213,66 @@ def process_upload_auto(df):
     return f"Xử lý xong {students_updated} HS. ({nam_hoc} - {hoc_ky})", "success"
 
 # ==========================================
-# 3. GIAO DIỆN HỌC SINH (MÀU XANH LỤC + XUỐNG DÒNG)
+# 3. GIAO DIỆN HỌC SINH (FIXED HTML DISPLAY)
 # ==========================================
 
 def render_html_grade_table(scores, loai_ky):
+    # Header chuẩn
     if loai_ky == "CaNam": headers = ["Môn học", "TB Cả Năm"]
     else: headers = ["Môn học", "ĐĐGtx (TX)", "ĐĐGgk (GK)", "ĐĐGck (CK)", "TB Môn"]
 
+    # Tạo Rows HTML (Viết liền mạch, không thụt dòng để tránh lỗi hiển thị Code block)
     rows_html = ""
     for s in scores:
-        # Wrap tên môn học vào div để dễ style
-        mon_html = f'<div class="mon-hoc">{s.mon_hoc}</div>'
-        
+        mon_div = f"<div class='mon-hoc'>{s.mon_hoc}</div>"
         if loai_ky == "CaNam":
-            rows_html += f"<tr><td>{mon_html}</td><td>{s.dtb_mon or '-'}</td></tr>"
+            rows_html += f"<tr><td>{mon_div}</td><td>{s.dtb_mon or '-'}</td></tr>"
         else:
-            rows_html += f"""<tr>
-                <td>{mon_html}</td>
-                <td class="col-tx">{s.ddg_tx or ''}</td>
-                <td>{s.ddg_gk or ''}</td>
-                <td>{s.ddg_ck or ''}</td>
-                <td>{s.dtb_mon or ''}</td>
-            </tr>"""
+            rows_html += f"<tr><td>{mon_div}</td><td class='tx-col'>{s.ddg_tx or ''}</td><td>{s.ddg_gk or ''}</td><td>{s.ddg_ck or ''}</td><td>{s.dtb_mon or ''}</td></tr>"
             
     thead = "".join([f"<th>{h}</th>" for h in headers])
     
-    # CSS Tùy chỉnh: Màu Xanh Lục, Xuống dòng Môn học
-    css = """<style>
-    .g-cont {overflow-x:auto; margin-bottom:15px; border:1px solid #c8e6c9; border-radius:8px; background:white;}
-    .vn-tbl {width:100%; border-collapse:collapse; font-family:sans-serif; font-size:14px; min-width:100%;}
-    .vn-tbl th, .vn-tbl td {padding:8px; border:1px solid #c8e6c9; text-align:center; vertical-align:middle;}
-    .vn-tbl th {background:#e8f5e9; color:#1b5e20; font-weight:bold;}
+    # CSS: Màu Xanh Lục (#2e7d32) cho chữ, Nền xanh nhạt (#e8f5e9) cho header
+    css = """<style>.g-cont {overflow-x:auto; margin-bottom:15px; border:1px solid #c8e6c9; border-radius:8px; background:white;} table {width:100%; border-collapse:collapse; font-family:sans-serif; font-size:14px; min-width:100%;} th, td {padding:8px; border:1px solid #c8e6c9; text-align:center; vertical-align:middle; color:#2e7d32;} th {background:#e8f5e9; color:#1b5e20; font-weight:bold;} th:first-child, td:first-child {position:sticky; left:0; background:#fff; z-index:5; text-align:left; border-right:2px solid #a5d6a7; color:#1b5e20; font-weight:bold; width:90px; min-width:90px; max-width:90px;} th:first-child {background:#e8f5e9; z-index:6;} .mon-hoc {white-space:normal; word-wrap:break-word; line-height:1.3;} .tx-col {white-space:normal; min-width:90px;} td:last-child {background:#f1f8e9; font-weight:bold; color:#1b5e20;}</style>"""
     
-    /* Sticky Column Môn Học - Màu Xanh Lục */
-    .vn-tbl th:first-child, .vn-tbl td:first-child {
-        position:sticky; left:0; background:#fff; z-index:5; 
-        text-align:left; border-right:2px solid #a5d6a7;
-        color: #2e7d32; font-weight:bold;
-        width: 90px; min-width: 90px; max-width: 90px; /* Cố định chiều rộng để ép xuống dòng */
-    }
-    .vn-tbl th:first-child {background:#e8f5e9; z-index:6;}
-    
-    /* Class cho tên môn học xuống dòng */
-    .mon-hoc {
-        white-space: normal; 
-        word-wrap: break-word; 
-        line-height: 1.2;
-    }
-    
-    /* Các cột điểm - Màu Xanh Lục */
-    .vn-tbl td { color: #2e7d32; font-weight: 500; }
-    
-    /* Cột điểm TX cho phép xuống dòng nếu quá dài */
-    .col-tx { white-space: normal; min-width: 80px; }
-    
-    /* Cột TB đậm hơn */
-    .vn-tbl td:last-child {color:#1b5e20; font-weight:bold; background:#e8f5e9;}
-    </style>"""
-    
-    return f"{css}<div class='g-cont'><table class='vn-tbl'><thead><tr>{thead}</tr></thead><tbody>{rows_html}</tbody></table></div>"
+    return f"{css}<div class='g-cont'><table><thead><tr>{thead}</tr></thead><tbody>{rows_html}</tbody></table></div>"
 
 def student_ui(user):
-    st.markdown(f"### 👋 Xin chào, {user.ho_ten}")
+    st.markdown(f"### 👋 Xin chào, <span style='color:#1b5e20'>{user.ho_ten}</span>", unsafe_allow_html=True)
     
-    # Check pass mặc định
+    # Bắt buộc đổi mật khẩu 123456
     if user.check_password("123456"):
-        st.warning("⚠️ CẢNH BÁO: Mật khẩu mặc định chưa an toàn.")
+        st.warning("⚠️ CẢNH BÁO: Mật khẩu mặc định.")
         st.info("🔒 Vui lòng đổi mật khẩu mới để xem điểm.")
         with st.form("change_pass_form"):
             new_p = st.text_input("Mật khẩu mới", type="password")
-            conf_p = st.text_input("Nhập lại mật khẩu", type="password")
-            if st.form_submit_button("Đổi mật khẩu & Xem điểm", type="primary"):
+            conf_p = st.text_input("Nhập lại", type="password")
+            if st.form_submit_button("Lưu & Xem điểm", type="primary"):
                 if new_p != conf_p: st.error("Mật khẩu không khớp.")
-                elif len(new_p) < 6: st.error("Mật khẩu quá ngắn.")
-                elif new_p == "123456": st.error("Không dùng lại mật khẩu cũ.")
+                elif len(new_p) < 6: st.error("Quá ngắn (>6 ký tự).")
+                elif new_p == "123456": st.error("Không dùng lại pass cũ.")
                 else:
-                    user.set_password(new_p)
-                    session.commit()
-                    st.success("Thành công! Đăng nhập lại nhé.")
-                    st.session_state.logged_in = False
-                    st.rerun()
+                    user.set_password(new_p); session.commit()
+                    st.success("Thành công! Đăng nhập lại."); st.session_state.logged_in = False; st.rerun()
         return
 
+    # Thông tin HS
     c1, c2, c3 = st.columns([1.5, 1.5, 1.2])
-    c1.info(f"🆔 Mã HS: **{user.ma_hs}**")
-    c2.info(f"📅 Niên khóa: **{user.nien_khoa}**")
+    c1.caption(f"🆔 Mã HS: **{user.ma_hs}**")
+    c2.caption(f"📅 Niên khóa: **{user.nien_khoa}**")
     
     is_full = (user.login_status == "full")
     st_text = "Vô hạn" if is_full else f"Còn {user.login_status} lần"
-    st_color = "green" if is_full else "orange"
-    c3.markdown(f"<div style='background:#fff; border:1px solid {st_color}; padding:8px; border-radius:5px; text-align:center; color:{st_color}; font-weight:bold'>Login: {st_text}</div>", unsafe_allow_html=True)
+    st_color = "#1b5e20" if is_full else "#e65100"
+    c3.markdown(f"<div style='border:1px solid {st_color}; padding:5px; border-radius:5px; text-align:center; color:{st_color}; font-size:13px'>Login: {st_text}</div>", unsafe_allow_html=True)
 
-    if st.button("Đăng xuất"):
-        st.session_state.logged_in = False
-        st.rerun()
+    if st.button("Đăng xuất"): st.session_state.logged_in = False; st.rerun()
     st.divider()
 
     try:
         start_year = int(user.nien_khoa.split('-')[0])
         years_map = {10: f"{start_year}-{start_year+1}", 11: f"{start_year+1}-{start_year+2}", 12: f"{start_year+2}-{start_year+3}"}
-    except: st.error("Lỗi niên khóa HS."); return
+    except: st.error("Lỗi Niên khóa (Admin cần nhập đúng format 2023-2026)."); return
 
     t10, t11, t12 = st.tabs(["Lớp 10", "Lớp 11", "Lớp 12"])
     
@@ -323,6 +290,7 @@ def student_ui(user):
                 st.info("📭 Chưa có dữ liệu.")
                 continue
             
+            # Render HTML Table (Quan trọng: unsafe_allow_html=True)
             if hk1:
                 st.markdown("**🍂 Học kỳ 1**")
                 st.markdown(render_html_grade_table(hk1, "HK1"), unsafe_allow_html=True)
@@ -334,13 +302,13 @@ def student_ui(user):
                 st.markdown(render_html_grade_table(cn, "CaNam"), unsafe_allow_html=True)
             
             if ass:
-                st.markdown(f"""<div style="background:#e3f2fd; padding:15px; border-radius:8px; border-left:5px solid #2196f3; margin-top:10px;"><h4 style="margin:0; color:#0d47a1">📝 Đánh giá cuối năm</h4><p style="margin:5px 0"><b>Học lực:</b> {ass.kq_hoc_tap or '--'} &nbsp;|&nbsp; <b>Hạnh kiểm:</b> {ass.kq_ren_luyen or '--'}</p><p style="margin:5px 0"><b>Danh hiệu:</b> <span style="color:red; font-weight:bold">{ass.danh_hieu or '--'}</span></p><p style="margin:5px 0; font-style:italic">"{ass.nhan_xet or ''}"</p></div>""", unsafe_allow_html=True)
+                st.markdown(f"""<div style="background:#e8f5e9; padding:15px; border-radius:8px; border-left:5px solid #2e7d32; margin-top:10px; color:#1b5e20"><h4 style="margin:0">📝 Đánh giá cuối năm</h4><p style="margin:5px 0"><b>Học lực:</b> {ass.kq_hoc_tap or '--'} &nbsp;|&nbsp; <b>Hạnh kiểm:</b> {ass.kq_ren_luyen or '--'}</p><p style="margin:5px 0"><b>Danh hiệu:</b> <span style="color:#d32f2f; font-weight:bold">{ass.danh_hieu or '--'}</span></p><p style="margin:5px 0; font-style:italic">"{ass.nhan_xet or ''}"</p></div>""", unsafe_allow_html=True)
 
 # ==========================================
 # 4. ADMIN UI
 # ==========================================
 def admin_ui():
-    st.title("⚙️ Trang Quản Trị")
+    st.title("⚙️ Quản Trị")
     if st.button("Đăng xuất"): st.session_state.logged_in = False; st.rerun()
 
     tab1, tab2 = st.tabs(["📤 Upload Dữ Liệu", "👥 Quản Lý User"])
@@ -389,7 +357,7 @@ def admin_ui():
                 except Exception as e: st.error(f"Lỗi {f.name}: {e}")
 
     with tab2:
-        st.subheader("Phân Quyền & Reset Mật Khẩu")
+        st.subheader("Phân Quyền & Reset Pass")
         users = session.query(User).filter(User.is_admin == False).all()
         if users:
             data = []
@@ -406,7 +374,7 @@ def admin_ui():
                 column_config={
                     "ID": None,
                     "Full Access": st.column_config.CheckboxColumn("Không giới hạn?", default=False),
-                    "Reset Pass (123456)": st.column_config.CheckboxColumn("Reset Mật Khẩu?", default=False, help="Tích vào để đặt lại mật khẩu về 123456"),
+                    "Reset Pass (123456)": st.column_config.CheckboxColumn("Reset Mật Khẩu?", default=False),
                     "Số lần": st.column_config.TextColumn("Lượt còn lại", disabled=True)
                 },
                 disabled=["Mã HS", "Họ Tên", "Niên khóa"],
@@ -422,10 +390,7 @@ def admin_ui():
                         cur_full = (u_db.login_status == "full")
                         if is_full and not cur_full: u_db.login_status = "full"; c_full += 1
                         elif not is_full and cur_full: u_db.login_status = "5"; c_full += 1
-                        
-                        if row['Reset Pass (123456)']:
-                            u_db.set_password('123456')
-                            c_reset += 1
+                        if row['Reset Pass (123456)']: u_db.set_password('123456'); c_reset += 1
                 session.commit()
                 st.success(f"Cập nhật quyền: {c_full} HS. Reset mật khẩu: {c_reset} HS.")
                 st.rerun()
