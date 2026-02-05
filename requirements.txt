@@ -4,3 +4,5 @@ openpyxl
 xlrd>=2.0.1
 sqlalchemy
 werkzeug
+psycopg2-binary
+
