@@ -27,8 +27,6 @@ except:
 Session = sessionmaker(bind=engine)
 session = Session()
 
-# ... (Phần Class User, Score, Assessment GIỮ NGUYÊN KHÔNG ĐỔI) ...
-
 class User(Base):
     __tablename__ = 'user'
     id = Column(Integer, primary_key=True)
@@ -38,7 +36,7 @@ class User(Base):
     password_hash = Column(String(200))
     is_admin = Column(Boolean, default=False)
     nien_khoa = Column(String(20)) 
-    login_status = Column(String(20), default="5") 
+    login_status = Column(String(20), default="full") 
     
     scores = relationship('Score', backref='student', lazy=True)
     assessments = relationship('Assessment', backref='student', lazy=True)
@@ -208,7 +206,7 @@ def process_upload_auto(df):
     return f"Xử lý xong {students_updated} HS. ({nam_hoc} - {hoc_ky})", "success"
 
 # ==========================================
-# 3. GIAO DIỆN HỌC SINH
+# 3. GIAO DIỆN HỌC SINH (MÀU XANH LỤC + XUỐNG DÒNG)
 # ==========================================
 
 def render_html_grade_table(scores, loai_ky):
@@ -217,44 +215,78 @@ def render_html_grade_table(scores, loai_ky):
 
     rows_html = ""
     for s in scores:
+        # Wrap tên môn học vào div để dễ style
+        mon_html = f'<div class="mon-hoc">{s.mon_hoc}</div>'
+        
         if loai_ky == "CaNam":
-            rows_html += f"<tr><td>{s.mon_hoc}</td><td>{s.dtb_mon or '-'}</td></tr>"
+            rows_html += f"<tr><td>{mon_html}</td><td>{s.dtb_mon or '-'}</td></tr>"
         else:
-            rows_html += f"<tr><td>{s.mon_hoc}</td><td style='white-space:normal; min-width:100px'>{s.ddg_tx or ''}</td><td>{s.ddg_gk or ''}</td><td>{s.ddg_ck or ''}</td><td>{s.dtb_mon or ''}</td></tr>"
+            rows_html += f"""<tr>
+                <td>{mon_html}</td>
+                <td class="col-tx">{s.ddg_tx or ''}</td>
+                <td>{s.ddg_gk or ''}</td>
+                <td>{s.ddg_ck or ''}</td>
+                <td>{s.dtb_mon or ''}</td>
+            </tr>"""
             
     thead = "".join([f"<th>{h}</th>" for h in headers])
-    css = """<style>.g-cont {overflow-x:auto; margin-bottom:15px; border:1px solid #ddd; border-radius:8px; background:white;} .vn-tbl {width:100%; border-collapse:collapse; font-family:sans-serif; font-size:14px; min-width:500px;} .vn-tbl th, .vn-tbl td {padding:10px; border:1px solid #ddd; text-align:center; white-space:nowrap;} .vn-tbl th {background:#f8f9fa; color:#333; font-weight:bold;} .vn-tbl th:first-child, .vn-tbl td:first-child {position:sticky; left:0; background:#fff; z-index:5; text-align:left; border-right:2px solid #ccc;} .vn-tbl th:first-child {background:#f8f9fa; z-index:6;} .vn-tbl td:last-child {color:#d32f2f; font-weight:bold; background:#fffde7;}</style>"""
+    
+    # CSS Tùy chỉnh: Màu Xanh Lục, Xuống dòng Môn học
+    css = """<style>
+    .g-cont {overflow-x:auto; margin-bottom:15px; border:1px solid #c8e6c9; border-radius:8px; background:white;}
+    .vn-tbl {width:100%; border-collapse:collapse; font-family:sans-serif; font-size:14px; min-width:100%;}
+    .vn-tbl th, .vn-tbl td {padding:8px; border:1px solid #c8e6c9; text-align:center; vertical-align:middle;}
+    .vn-tbl th {background:#e8f5e9; color:#1b5e20; font-weight:bold;}
+    
+    /* Sticky Column Môn Học - Màu Xanh Lục */
+    .vn-tbl th:first-child, .vn-tbl td:first-child {
+        position:sticky; left:0; background:#fff; z-index:5; 
+        text-align:left; border-right:2px solid #a5d6a7;
+        color: #2e7d32; font-weight:bold;
+        width: 90px; min-width: 90px; max-width: 90px; /* Cố định chiều rộng để ép xuống dòng */
+    }
+    .vn-tbl th:first-child {background:#e8f5e9; z-index:6;}
+    
+    /* Class cho tên môn học xuống dòng */
+    .mon-hoc {
+        white-space: normal; 
+        word-wrap: break-word; 
+        line-height: 1.2;
+    }
+    
+    /* Các cột điểm - Màu Xanh Lục */
+    .vn-tbl td { color: #2e7d32; font-weight: 500; }
+    
+    /* Cột điểm TX cho phép xuống dòng nếu quá dài */
+    .col-tx { white-space: normal; min-width: 80px; }
+    
+    /* Cột TB đậm hơn */
+    .vn-tbl td:last-child {color:#1b5e20; font-weight:bold; background:#e8f5e9;}
+    </style>"""
+    
     return f"{css}<div class='g-cont'><table class='vn-tbl'><thead><tr>{thead}</tr></thead><tbody>{rows_html}</tbody></table></div>"
 
 def student_ui(user):
     st.markdown(f"### 👋 Xin chào, {user.ho_ten}")
     
-    # ----------------------------------------------------
-    # TÍNH NĂNG: KIỂM TRA MẬT KHẨU MẶC ĐỊNH (123456)
-    # ----------------------------------------------------
+    # Check pass mặc định
     if user.check_password("123456"):
-        st.warning("⚠️ CẢNH BÁO: Bạn đang sử dụng mật khẩu mặc định.")
-        st.info("🔒 Để bảo mật thông tin điểm số, bạn BẮT BUỘC phải đổi mật khẩu mới để tiếp tục.")
-        
+        st.warning("⚠️ CẢNH BÁO: Mật khẩu mặc định chưa an toàn.")
+        st.info("🔒 Vui lòng đổi mật khẩu mới để xem điểm.")
         with st.form("change_pass_form"):
-            st.write("---")
             new_p = st.text_input("Mật khẩu mới", type="password")
-            conf_p = st.text_input("Nhập lại mật khẩu mới", type="password")
+            conf_p = st.text_input("Nhập lại mật khẩu", type="password")
             if st.form_submit_button("Đổi mật khẩu & Xem điểm", type="primary"):
-                if new_p != conf_p:
-                    st.error("Mật khẩu xác nhận không khớp.")
-                elif len(new_p) < 6:
-                    st.error("Mật khẩu phải dài hơn 6 ký tự.")
-                elif new_p == "123456":
-                    st.error("Không được đặt trùng với mật khẩu mặc định!")
+                if new_p != conf_p: st.error("Mật khẩu không khớp.")
+                elif len(new_p) < 6: st.error("Mật khẩu quá ngắn.")
+                elif new_p == "123456": st.error("Không dùng lại mật khẩu cũ.")
                 else:
                     user.set_password(new_p)
                     session.commit()
-                    st.success("Đổi mật khẩu thành công! Vui lòng đăng nhập lại.")
+                    st.success("Thành công! Đăng nhập lại nhé.")
                     st.session_state.logged_in = False
                     st.rerun()
-        return # DỪNG KHÔNG CHO XEM ĐIỂM NẾU CHƯA ĐỔI PASS
-    # ----------------------------------------------------
+        return
 
     c1, c2, c3 = st.columns([1.5, 1.5, 1.2])
     c1.info(f"🆔 Mã HS: **{user.ma_hs}**")
@@ -315,7 +347,7 @@ def admin_ui():
 
     with tab1:
         st.subheader("1. Import User (Excel)")
-        st.caption("Cột cần thiết: CCCD, Ma_HS, Ho_Ten, Nien_Khoa (2023-2026)")
+        st.caption("Cột: CCCD, Ma_HS, Ho_Ten, Nien_Khoa (2023-2026)")
         f_acc = st.file_uploader("Chọn file User", key="acc")
         if f_acc and st.button("Import"):
             try:
@@ -386,13 +418,11 @@ def admin_ui():
                 for idx, row in edited_df.iterrows():
                     u_id = row['ID']; u_db = session.query(User).get(int(u_id))
                     if u_db:
-                        # Logic Full
                         is_full = row['Full Access']
                         cur_full = (u_db.login_status == "full")
                         if is_full and not cur_full: u_db.login_status = "full"; c_full += 1
                         elif not is_full and cur_full: u_db.login_status = "5"; c_full += 1
                         
-                        # Logic Reset Pass
                         if row['Reset Pass (123456)']:
                             u_db.set_password('123456')
                             c_reset += 1
@@ -437,4 +467,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
